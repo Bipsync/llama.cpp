@@ -8,6 +8,7 @@
 #include "ggml.h"
 #include "llama.h"
 
+#include <atomic>
 #include <list>
 #include <set>
 #include <sstream>
@@ -46,6 +47,17 @@ struct common_time_meas {
 
     int64_t & t_acc;
 };
+
+struct common_power_throttle {
+    std::atomic<int32_t> percent{100};
+    double  batch_avg_us = 0.0;
+    double  token_avg_us = 0.0;
+};
+
+void common_power_throttle_init(common_power_throttle & throttle, int32_t percent);
+bool common_power_throttle_enabled(const common_power_throttle * throttle);
+int  common_power_decode(struct llama_context * ctx, struct llama_batch batch, common_power_throttle * throttle);
+void common_power_throttle_apply(common_power_throttle * throttle, double work_us, bool single_token);
 
 struct common_adapter_lora_info {
     std::string path;
@@ -336,6 +348,9 @@ struct common_params_speculative_draft {
     llama_context * ctx_tgt = nullptr;
     llama_context * ctx_dft = nullptr;
 
+    // power throttle for the draft model compute (null or percent >= 100: no-op)
+    common_power_throttle * power_throttle = nullptr;
+
     int32_t n_gpu_layers = -1; // number of layers to store in VRAM for the draft model (-1 - use default)
 
     ggml_type cache_type_k = GGML_TYPE_F16; // KV cache data type for the K
@@ -567,6 +582,7 @@ struct common_params {
     bool simple_io         = false; // improves compatibility with subprocesses and limited consoles
     bool cont_batching     = true;  // insert new sequences for decoding on-the-fly
     bool no_perf           = false; // disable performance metrics
+    int32_t power_percent  = 100;   // target compute duty cycle percentage, 1..100
     bool show_timings      = true;  // show timing information on CLI
     bool ctx_shift         = false; // context shift on infinite text generation
     bool swa_full          = false; // use full-size SWA cache (https://github.com/ggml-org/llama.cpp/pull/13194#issuecomment-2868343055)
@@ -1032,7 +1048,8 @@ bool common_prompt_batch_decode(
                                int & n_past,
                                int   n_batch,
                   std::string_view   state_path,
-                              bool   save_state);
+                              bool   save_state,
+             common_power_throttle * power_throttle = nullptr);
 
 // replays the last token after loading state to regenerate logits
 // used after loading session state to ensure the sampling context has valid logits

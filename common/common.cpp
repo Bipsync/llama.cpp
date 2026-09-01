@@ -71,6 +71,67 @@ common_time_meas::~common_time_meas() {
     }
 }
 
+void common_power_throttle_init(common_power_throttle & throttle, int32_t percent) {
+    throttle.percent.store(percent > 0 ? std::min<int32_t>(percent, 100) : 100);
+    throttle.batch_avg_us = 0.0;
+    throttle.token_avg_us = 0.0;
+}
+
+bool common_power_throttle_enabled(const common_power_throttle * throttle) {
+    if (!throttle) {
+        return false;
+    }
+    const int32_t percent = throttle->percent.load();
+    return percent > 0 && percent < 100;
+}
+
+static double common_power_update_avg(double avg, double sample) {
+    if (sample <= 0.0 || !std::isfinite(sample)) {
+        return avg;
+    }
+    if (avg <= 0.0 || !std::isfinite(avg)) {
+        return sample;
+    }
+    return avg * 0.875 + sample * 0.125;
+}
+
+static void common_power_sleep_us(double work_us, int32_t percent) {
+    if (percent <= 0 || percent >= 100 || work_us <= 0.0 || !std::isfinite(work_us)) {
+        return;
+    }
+
+    const double sleep_us = work_us * (100.0 - (double) percent) / (double) percent;
+    if (sleep_us >= 1.0 && std::isfinite(sleep_us)) {
+        std::this_thread::sleep_for(std::chrono::microseconds((int64_t) sleep_us));
+    }
+}
+
+int common_power_decode(llama_context * ctx, llama_batch batch, common_power_throttle * throttle) {
+    if (!common_power_throttle_enabled(throttle)) {
+        return llama_decode(ctx, batch);
+    }
+
+    const int64_t t0 = llama_time_us();
+    const int ret = llama_decode(ctx, batch);
+    if (ret == 0) {
+        llama_synchronize(ctx);
+        const int64_t elapsed_us = llama_time_us() - t0;
+        common_power_throttle_apply(throttle, (double) elapsed_us, batch.n_tokens == 1);
+    }
+
+    return ret;
+}
+
+void common_power_throttle_apply(common_power_throttle * throttle, double work_us, bool single_token) {
+    if (!common_power_throttle_enabled(throttle) || !std::isfinite(work_us) || work_us <= 0.0) {
+        return;
+    }
+
+    double & avg_us = single_token ? throttle->token_avg_us : throttle->batch_avg_us;
+    avg_us = common_power_update_avg(avg_us, work_us);
+    common_power_sleep_us(avg_us, throttle->percent.load());
+}
+
 //
 // CPU utils
 //
@@ -2206,7 +2267,8 @@ bool common_prompt_batch_decode(
                                int & n_past,
                                int   n_batch,
                   std::string_view   state_path,
-                              bool   save_state) {
+                              bool   save_state,
+             common_power_throttle * power_throttle) {
     if (n_new == 0) {
         return true;
     }
@@ -2222,7 +2284,7 @@ bool common_prompt_batch_decode(
         // Memory implementations in recurrent/hybrid models don't support removing tokens from their
         // memory, so we can't just remove the last token from the memory and replay the last token which
         // is the reason for this logic.
-        if (llama_decode(ctx, llama_batch_get_one(const_cast<llama_token*>(all_tokens.data() + offset), n_tokens_before_last))) {
+        if (common_power_decode(ctx, llama_batch_get_one(const_cast<llama_token*>(all_tokens.data() + offset), n_tokens_before_last), power_throttle)) {
             COM_ERR("%s", "failed to eval\n");
             return false;
         }
@@ -2236,13 +2298,13 @@ bool common_prompt_batch_decode(
         int32_t pos = n_past;
         batch.pos = &pos;
 
-        if (llama_decode(ctx, batch)) {
+        if (common_power_decode(ctx, batch, power_throttle)) {
             COM_ERR("%s", "failed to eval last token\n");
             return false;
         }
         n_past++;
     } else {
-        if (llama_decode(ctx, llama_batch_get_one(const_cast<llama_token*>(all_tokens.data() + offset), n_new))) {
+        if (common_power_decode(ctx, llama_batch_get_one(const_cast<llama_token*>(all_tokens.data() + offset), n_new), power_throttle)) {
             COM_ERR("%s", "failed to eval\n");
             return false;
         }
